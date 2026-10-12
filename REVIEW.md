@@ -26,6 +26,10 @@ Line numbers refer to the original starter file.
 | 18 | `list_employees`, line 95 | There's no sort, so the page order isn't guaranteed and paging can repeat or skip rows. | The order changes with insert order. The contract says to sort by `emp_code`. | Sorts by `emp_code` ascending in MongoDB, backed by an index. |
 | 19 | `list_employees`, line 89 | `page` and `page_size` have no limits. | `page=0` and `page_size=1000` are accepted, `page_size=0` returns every employee, and `page=-1` gives a 500. | `page >= 1` and `1 <= page_size <= 100`. Anything else is a 422. |
 | 20 | `list_employees`, line 95 | Items return `created_at` as a datetime, not epoch ms. | `created_at` comes back as an ISO string. | Each item goes through `serialize_employee()`. |
+| 21 | `compute_work_hours`, line 41 | `round()` isn't half-up. It uses float maths and rounds halves to even. | 9h 07m 30s is exactly 9.125 hours. Expected 9.13, got 9.12. | Works on whole seconds with `Decimal` and `ROUND_HALF_UP`. |
+| 22 | `compute_overtime`, line 47 | There's no 30-minute minimum. Any time after shift end counts. | Shift ends 18:30, punch out at 18:35. Expected 0, got 5. | Floors to whole minutes, then returns 0 unless it's at least 30. |
+| 23 | `compute_overtime`, line 46 | The shift end is always put on the attendance date, so an overnight shift ends a day too early. | Shift 22:00-06:00 starting on the 6th, punch out at 06:40 on the 7th. Expected 40, got 1480. | Added `shift_end_at()`, which moves the end to the next day when `shift_end <= shift_start`. |
+| 24 | `compute_overtime`, line 47 | It subtracts an IST-aware shift end from `punch_out`, which is naive everywhere else in the starter. | Calling it with the starter's naive punch time raises `TypeError: can't subtract offset-naive and offset-aware datetimes`, which would be a 500. | All datetimes are UTC-aware now (client `tz_aware=True` and the time helpers), and the time is truncated to whole seconds first. |
 
 Also note anything you looked at and decided was **not** a defect, and why.
 
