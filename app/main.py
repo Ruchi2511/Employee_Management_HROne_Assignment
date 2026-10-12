@@ -10,21 +10,92 @@ openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Annotated, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, StrictInt
 from pymongo import MongoClient
 
 load_dotenv()
 
-client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
+client = MongoClient(
+    os.getenv("MONGO_URI", "mongodb://localhost:27017"),
+    tz_aware=True,
+    serverSelectionTimeoutMS=5000,
+)
 db = client[os.getenv("MONGO_DB", "attendance_db")]
 
+UTC = timezone.utc
 IST = timezone(timedelta(hours=5, minutes=30))
+EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+MIN_EPOCH_MS = 100_000_000_000
+MAX_EPOCH_MS = 4_102_444_800_000
+
+# StrictInt rejects floats, numeric strings and bools, so FastAPI returns 422 for them
+EpochMillis = Annotated[StrictInt, Field(ge=MIN_EPOCH_MS, le=MAX_EPOCH_MS)]
 
 app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
+
+
+# --------------------------------------------------------------------------- #
+# Time helpers
+# --------------------------------------------------------------------------- #
+def truncate_to_second(dt: datetime) -> datetime:
+    return dt.replace(microsecond=0)
+
+
+def utc_now() -> datetime:
+    return truncate_to_second(datetime.now(UTC))
+
+
+def ms_to_datetime(ms: int) -> datetime:
+    # integer division keeps it exact and drops the sub-second part (R1)
+    return datetime.fromtimestamp(ms // 1000, tz=UTC)
+
+
+def datetime_to_ms(dt: datetime) -> int:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)  # PyMongo treats naive datetimes as UTC
+    return (dt - EPOCH) // timedelta(seconds=1) * 1000
+
+
+def _ms_or_none(value):
+    return datetime_to_ms(value) if isinstance(value, datetime) else value
+
+
+# --------------------------------------------------------------------------- #
+# Serializers
+# --------------------------------------------------------------------------- #
+def serialize_history_entry(entry: dict) -> dict:
+    changes = {}
+    for field, change in (entry.get("changes") or {}).items():
+        if field in ("punch_in", "punch_out"):
+            change = {"from": _ms_or_none(change.get("from")), "to": _ms_or_none(change.get("to"))}
+        changes[field] = change
+    return {
+        "at": _ms_or_none(entry.get("at")),
+        "by": entry.get("by"),
+        "reason": entry.get("reason"),
+        "changes": changes,
+    }
+
+
+def serialize_attendance(doc: dict) -> dict:
+    # explicit field list so _id never leaks; legacy records may lack the last few fields
+    return {
+        "emp_code": doc["emp_code"],
+        "date": doc["date"],
+        "status": doc["status"],
+        "punch_in": _ms_or_none(doc.get("punch_in")),
+        "punch_out": _ms_or_none(doc.get("punch_out")),
+        "work_hours": doc.get("work_hours"),
+        "late_minutes": doc.get("late_minutes") or 0,
+        "overtime_minutes": doc.get("overtime_minutes") or 0,
+        "half_day": bool(doc.get("half_day", False)),
+        "history": [serialize_history_entry(e) for e in doc.get("history") or []],
+    }
 
 
 # --------------------------------------------------------------------------- #
