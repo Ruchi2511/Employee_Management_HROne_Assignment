@@ -10,8 +10,8 @@ openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timedelta, timezone
-from typing import Annotated, Optional
+from datetime import date, datetime, time, timedelta, timezone
+from typing import Annotated, Literal, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
@@ -152,11 +152,22 @@ def serialize_attendance(doc: dict) -> dict:
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
-def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
-    h, m = map(int, shift_start.split(":"))
-    start = punch_in.replace(hour=h, minute=m, second=0, microsecond=0)
-    minutes = int((punch_in - start).total_seconds() / 60)
-    return minutes if minutes > 10 else 0
+def attendance_date(punch_in: datetime, shift_start: str, shift_end: str) -> str:
+    local = punch_in.astimezone(IST)
+    # overnight shift: an early-morning punch belongs to the shift that started the day before
+    if shift_end <= shift_start and local.time() < time.fromisoformat(shift_end):
+        return (local.date() - timedelta(days=1)).isoformat()
+    return local.date().isoformat()
+
+
+def shift_start_at(date_str: str, shift_start: str) -> datetime:
+    return datetime.combine(date.fromisoformat(date_str), time.fromisoformat(shift_start), tzinfo=IST)
+
+
+def compute_late_minutes(punch_in: datetime, shift_start: str, date_str: str) -> int:
+    seconds = int((truncate_to_second(punch_in) - shift_start_at(date_str, shift_start)).total_seconds())
+    # grace is exactly 10:00; once past it, lateness counts from shift start
+    return seconds // 60 if seconds > 600 else 0
 
 
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
@@ -198,10 +209,14 @@ class EmployeeIn(BaseModel):
         return self
 
 
+PresenceStatus = Literal["PRESENT", "WFH", "ON_DUTY"]
+
+
 class PunchInIn(BaseModel):
     emp_code: str
-    punched_at: Optional[int] = None
-    status: str = "PRESENT"
+    # defaults aren't validated, so omitting it gives None but an explicit null is a 422
+    punched_at: EpochMillis = None
+    status: PresenceStatus = "PRESENT"
 
 
 # --------------------------------------------------------------------------- #
@@ -243,11 +258,11 @@ def list_employees(
 
 @app.post("/attendance/punch-in", status_code=201)
 def punch_in(body: PunchInIn):
-    emp = db.employees.find_one({"emp_code": body.emp_code})
-    ts = datetime.fromtimestamp(body.punched_at / 1000) if body.punched_at else datetime.now()
-    d = ts.date().isoformat()
-    if db.attendance_logs.find_one({"emp_code": body.emp_code, "date": d}):
-        raise HTTPException(409, "already punched in for this date")
+    emp = db.employees.find_one({"emp_code": body.emp_code}, {"shift_start": 1, "shift_end": 1})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+    ts = ms_to_datetime(body.punched_at) if body.punched_at is not None else utc_now()
+    d = attendance_date(ts, emp["shift_start"], emp["shift_end"])
     doc = {
         "emp_code": body.emp_code,
         "date": d,
@@ -255,15 +270,17 @@ def punch_in(body: PunchInIn):
         "punch_in": ts,
         "punch_out": None,
         "work_hours": None,
-        "late_minutes": compute_late_minutes(ts, emp["shift_start"]),
+        "late_minutes": compute_late_minutes(ts, emp["shift_start"], d),
         "overtime_minutes": 0,
         "half_day": False,
         "history": [],
     }
-    res = db.attendance_logs.insert_one(doc)
-    doc["id"] = str(res.inserted_id)
-    doc.pop("_id", None)
-    return doc
+    # the unique (emp_code, date) index settles races, so no check-then-insert
+    try:
+        db.attendance_logs.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(409, "already punched in for this date")
+    return serialize_attendance(doc)
 
 
 @app.get("/attendance")
