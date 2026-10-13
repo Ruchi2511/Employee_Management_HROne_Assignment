@@ -2,7 +2,7 @@
 
 1. **Indexes.** Which indexes did you create, and which query or guarantee does each one serve? Which one did you consider and reject?
 
-   On employees, a unique `emp_code` blocks duplicates, `{department, emp_code}` serves the employee list, and `joined_on` finds who had joined for the department summary. On attendance logs, the unique `{emp_code, date}` index keeps one record per person per day and serves PATCH and the monthly reports. `{emp_code, punch_in}` serves punch-out, and `{date, emp_code}` serves the attendance list and leaderboard.
+   On employees, a unique `emp_code` blocks duplicates, `{department, emp_code}` serves the employee list and trend, and `joined_on` finds who had joined for the department summary. On attendance logs, the unique `{emp_code, date}` index keeps one record per person per day and serves PATCH and the reports. `{emp_code, punch_in}` serves punch-out, and `{date, emp_code}` serves the attendance list and leaderboard.
 
 2. **Punch-in race.** Two identical punch-in requests arrive at the same instant. Walk through exactly what happens in your code.
 

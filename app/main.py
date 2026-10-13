@@ -674,8 +674,99 @@ def late_leaderboard(
     return {"month": month, "items": items}
 
 
+MAX_TREND_DAYS = 92
+
+
+def round_half_up_expr(expr, places: int = 4) -> dict:
+    # R8 inside the pipeline ($round is half-to-even); decimal maths so 0.03125 stays exact. Values are never negative.
+    scale = 10 ** places
+    return {"$divide": [{"$floor": {"$add": [{"$multiply": [{"$toDecimal": expr}, scale]}, Decimal128("0.5")]}},
+                        scale]}
+
+
+def department_trend_pipeline(department: str, start: str, end: str) -> list[dict]:
+    first_day = datetime.fromisoformat(start).replace(tzinfo=UTC)
+    after_last_day = datetime.fromisoformat(end).replace(tzinfo=UTC) + timedelta(days=1)
+    is_working_day = {"$lte": [{"$isoDayOfWeek": "$day"}, 5]}
+    return [
+        # R9: employees who join after the range never count; the rest count from max(joined_on, start)
+        {"$match": {"department": department, "joined_on": {"$lte": end}}},
+        {
+            "$lookup": {
+                "from": "attendance_logs",
+                "localField": "emp_code",
+                "foreignField": "emp_code",
+                "pipeline": [
+                    {"$match": {"date": {"$gte": start, "$lte": end}}},
+                    {"$project": {"_id": 0, "date": 1, "joins": {"$literal": 0}, "present": PRESENT_VALUE,
+                                  "late": {"$cond": [{"$gt": [LATE_MINUTES, 0]}, 1, 0]}}},
+                ],
+                "as": "logs",
+            }
+        },
+        # one "joins" event per employee plus one event per log, then totals per day
+        {"$project": {"_id": 0, "events": {"$concatArrays": [
+            [{"date": {"$max": ["$joined_on", start]}, "joins": 1, "present": 0, "late": 0}], "$logs"]}}},
+        {"$unwind": "$events"},
+        {"$replaceRoot": {"newRoot": "$events"}},
+        # an empty row on the first day keeps the series alive when there are no events at all
+        {"$unionWith": {"pipeline": [{"$documents": [{"date": start, "joins": 0, "present": 0, "late": 0}]}]}},
+        {"$group": {"_id": "$date", "joins": {"$sum": "$joins"}, "present": {"$sum": "$present"},
+                    "late": {"$sum": "$late"}}},
+        {"$set": {"day": {"$dateFromString": {"dateString": "$_id", "format": "%Y-%m-%d", "timezone": "UTC"}}}},
+        # one row per calendar day, including weekends and days with no records
+        {"$densify": {"field": "day", "range": {"step": 1, "unit": "day", "bounds": [first_day, after_last_day]}}},
+        {"$fill": {"output": {"joins": {"value": 0}, "present": {"value": 0}, "late": {"value": 0}}}},
+        {"$setWindowFields": {"sortBy": {"day": 1}, "output": {
+            "headcount": {"$sum": "$joins", "window": {"documents": ["unbounded", "current"]}}}}},
+        {"$set": {"is_working_day": is_working_day}},
+        {"$set": {"attendance_rate": {"$cond": [
+            {"$and": ["$is_working_day", {"$gt": ["$headcount", 0]}]},
+            round_half_up_expr({"$divide": [{"$toDecimal": "$present"}, "$headcount"]}),
+            None,
+        ]}}},
+        # $avg skips nulls and gives null when the window has no rates; the window stays inside the range
+        {"$setWindowFields": {"sortBy": {"day": 1}, "output": {
+            "moving_avg_7d": {"$avg": "$attendance_rate", "window": {"documents": [-6, 0]}}}}},
+        {"$sort": {"day": 1}},
+        {"$project": {
+            "_id": 0,
+            "date": {"$dateToString": {"date": "$day", "format": "%Y-%m-%d"}},
+            "is_working_day": 1,
+            "headcount": 1,
+            "present_count": {"$toDouble": "$present"},
+            "late_count": "$late",
+            "attendance_rate": {"$toDouble": "$attendance_rate"},
+            "moving_avg_7d": {"$toDouble": {"$cond": [{"$eq": ["$moving_avg_7d", None]}, None,
+                                                      round_half_up_expr("$moving_avg_7d")]}},
+        }},
+    ]
+
+
+@app.get("/analytics/departments/{department}/trend")
+def department_trend(
+    department: str,
+    start: str = Query(alias="from", pattern=DATE_PATTERN),
+    end: str = Query(alias="to", pattern=DATE_PATTERN),
+):
+    days = {}
+    for name, value in (("from", start), ("to", end)):
+        try:
+            days[name] = date.fromisoformat(value)
+        except ValueError:
+            raise validation_error(name, "not a valid calendar date", "query")
+    if days["to"] < days["from"]:
+        raise validation_error("to", "must be on or after from", "query")
+    if (days["to"] - days["from"]).days + 1 > MAX_TREND_DAYS:
+        raise validation_error("to", f"range is longer than {MAX_TREND_DAYS} days", "query")
+
+    if db.employees.find_one({"department": department}, {"_id": 1}) is None:
+        raise HTTPException(404, "department not found")
+    items = list(db.employees.aggregate(department_trend_pipeline(department, start, end)))
+    return {"department": department, "items": items}
+
+
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   GET   /analytics/departments/{department}/trend
 #   GET   /admin/explain/{endpoint}
 # --------------------------------------------------------------------------- #
