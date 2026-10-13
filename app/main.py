@@ -15,7 +15,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from typing import Annotated, Literal, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Path, Query
 from fastapi.exceptions import RequestValidationError
 from pydantic import AfterValidator, BaseModel, Field, StrictInt, model_validator
 import pymongo
@@ -99,8 +99,9 @@ def datetime_to_ms(dt: datetime) -> int:
         dt = dt.replace(tzinfo=UTC)  # PyMongo treats naive datetimes as UTC
     return (dt - EPOCH) // timedelta(seconds=1) * 1000
 
-def validation_error(field: str, msg: str, where: str = "body") -> RequestValidationError:
-    return RequestValidationError([{"type": "value_error", "loc": (where, field), "msg": msg, "input": None}])
+def validation_error(field: Optional[str], msg: str, where: str = "body") -> RequestValidationError:
+    loc = (where, field) if field else (where,)
+    return RequestValidationError([{"type": "value_error", "loc": loc, "msg": msg, "input": None}])
 
 def _ms_or_none(value):
     return datetime_to_ms(value) if isinstance(value, datetime) else value
@@ -234,6 +235,15 @@ class PunchOutIn(BaseModel):
     punched_at: EpochMillis = None
 
 
+class RegularizeIn(BaseModel):
+    # omitted means unchanged; an explicit null is a 422. Derived fields sent by a client are ignored.
+    status: Status = None
+    punch_in: EpochMillis = None
+    punch_out: EpochMillis = None
+    reason: str = Field(min_length=5, max_length=200)
+    regularized_by: str = Field(min_length=1, max_length=50)
+
+
 # --------------------------------------------------------------------------- #
 # Endpoints provided
 # --------------------------------------------------------------------------- #
@@ -330,9 +340,12 @@ def punch_out(body: PunchOutIn):
         "overtime_minutes": compute_overtime(ts, emp["shift_start"], emp["shift_end"], record["date"]),
         "half_day": work_hours < 4.5,
     }
-    # matching on punch_out: null makes this atomic, so only one concurrent punch-out wins
+    # matching on punch_out: null makes this atomic, so only one concurrent punch-out wins;
+    # matching punch_in too stops a concurrent correction from leaving stale work hours behind
     updated = db.attendance_logs.find_one_and_update(
-        {"_id": record["_id"], "punch_out": None}, {"$set": updates}, return_document=ReturnDocument.AFTER
+        {"_id": record["_id"], "punch_out": None, "punch_in": record["punch_in"]},
+        {"$set": updates},
+        return_document=ReturnDocument.AFTER,
     )
     if updated is None:
         raise HTTPException(409, "already punched out")
@@ -380,11 +393,102 @@ def list_attendance(
     items = [serialize_attendance(d) for d in docs]
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
+NON_PRESENCE = ("ABSENT", "LEAVE")
+EDITABLE_FIELDS = ("status", "punch_in", "punch_out")
+TRACKED_FIELDS = EDITABLE_FIELDS + ("work_hours", "late_minutes", "overtime_minutes", "half_day")
+
+def plan_regularization(record: dict, emp: dict, body: RegularizeIn) -> tuple[dict, dict]:
+    """Returns the record's new tracked fields and the history diff, or raises a 422."""
+    current = {
+        "status": record["status"],
+        "punch_in": record.get("punch_in"),
+        "punch_out": record.get("punch_out"),
+        "work_hours": record.get("work_hours"),
+        "late_minutes": record.get("late_minutes") or 0,
+        "overtime_minutes": record.get("overtime_minutes") or 0,
+        "half_day": bool(record.get("half_day", False)),
+    }
+    status = body.status if body.status is not None else current["status"]
+
+    if status in NON_PRESENCE:
+        for field in ("punch_in", "punch_out"):
+            if getattr(body, field) is not None:
+                raise validation_error(field, f"must not be set when status is {status}")
+        final = {"status": status, "punch_in": None, "punch_out": None,
+                 "work_hours": None, "late_minutes": 0, "overtime_minutes": 0, "half_day": False}
+    else:
+        punch_in = ms_to_datetime(body.punch_in) if body.punch_in is not None else current["punch_in"]
+        punch_out = ms_to_datetime(body.punch_out) if body.punch_out is not None else current["punch_out"]
+        if punch_in is None:
+            raise validation_error("punch_in", f"is required when status is {status}")
+        if attendance_date(punch_in, emp["shift_start"], emp["shift_end"]) != record["date"]:
+            raise validation_error("punch_in", "must fall on the record's attendance date")
+        if punch_out is not None:
+            started, ended = truncate_to_second(punch_in), truncate_to_second(punch_out)
+            if ended <= started or ended - started > timedelta(hours=24):
+                raise validation_error("punch_out", "must be after punch_in and within 24 hours of it")
+
+        late = compute_late_minutes(punch_in, emp["shift_start"], record["date"])
+        final = {"status": status, "punch_in": punch_in, "punch_out": punch_out,
+                 "work_hours": None, "late_minutes": late, "overtime_minutes": 0, "half_day": False}
+        if punch_out is not None:
+            hours = compute_work_hours(punch_in, punch_out)
+            final.update(
+                work_hours=hours,
+                overtime_minutes=compute_overtime(punch_out, emp["shift_start"], emp["shift_end"], record["date"]),
+                half_day=hours < 4.5,
+            )
+
+    # only the editable fields decide whether anything changed; this is not a repair endpoint
+    if all(final[f] == current[f] for f in EDITABLE_FIELDS):
+        raise validation_error(None, "request changes nothing")
+    changes = {f: {"from": current[f], "to": final[f]} for f in TRACKED_FIELDS if final[f] != current[f]}
+    return final, changes
+
+
+@app.patch("/attendance/{emp_code}/{date}")
+def regularize_attendance(
+    emp_code: str,
+    date: Annotated[str, Path(pattern=DATE_PATTERN)],
+    body: RegularizeIn,
+):
+    try:
+        _check_calendar_date(date)
+    except ValueError:
+        raise validation_error("date", "not a valid calendar date", "path")
+
+    emp = db.employees.find_one({"emp_code": emp_code}, {"shift_start": 1, "shift_end": 1})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+    record = db.attendance_logs.find_one({"emp_code": emp_code, "date": date})
+    if record is None:
+        raise HTTPException(404, "attendance record not found")
+
+    final, changes = plan_regularization(record, emp, body)
+    entry = {"at": utc_now(), "by": body.regularized_by, "reason": body.reason, "changes": changes}
+
+    # optimistic lock: only write if nobody changed the record since we read it.
+    # Every correction adds a history entry, so the history length acts as a version.
+    history = record.get("history")
+    guard = {
+        "_id": record["_id"],
+        "status": record["status"],
+        "punch_in": record.get("punch_in"),
+        "punch_out": record.get("punch_out"),
+        "history": {"$size": len(history)} if history is not None else None,
+    }
+    if history is None:
+        update = {"$set": {**final, "history": [entry]}}
+    else:
+        update = {"$set": final, "$push": {"history": entry}}
+    updated = db.attendance_logs.find_one_and_update(guard, update, return_document=ReturnDocument.AFTER)
+    if updated is None:
+        raise HTTPException(409, "record was changed by another request, retry")
+    return serialize_attendance(updated)
+
 
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   POST  /attendance/punch-out
-#   PATCH /attendance/{emp_code}/{date}
 #   GET   /analytics/employees/{emp_code}/monthly
 #   GET   /analytics/departments/summary
 #   GET   /analytics/leaderboard/late
