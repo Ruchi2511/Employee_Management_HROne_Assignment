@@ -488,8 +488,85 @@ def regularize_attendance(
 
 
 # --------------------------------------------------------------------------- #
+# Analytics
+# --------------------------------------------------------------------------- #
+MONTH_PATTERN = r"^[0-9]{4}-(0[1-9]|1[0-2])$"
+PRESENCE_STATUSES = ["PRESENT", "WFH", "ON_DUTY"]
+
+# stored dates are "YYYY-MM-DD" strings, so the weekday is derived from the string (1 = Monday)
+IS_WEEKDAY = {"$lte": [{"$isoDayOfWeek": {"$dateFromString": {"dateString": "$date", "format": "%Y-%m-%d"}}}, 5]}
+# R5/R6: a presence record is one day, or half a day when half_day is set; missing half_day means false
+PRESENT_VALUE = {
+    "$cond": [
+        {"$in": ["$status", PRESENCE_STATUSES]},
+        {"$cond": [{"$eq": [{"$ifNull": ["$half_day", False]}, True]}, 0.5, 1]},
+        0,
+    ]
+}
+LATE_MINUTES = {"$ifNull": ["$late_minutes", 0]}
+
+
+def month_bounds(month: str) -> tuple[date, date]:
+    first = date.fromisoformat(f"{month}-01")
+    next_first = (first + timedelta(days=32)).replace(day=1)
+    return first, next_first - timedelta(days=1)
+
+
+def count_working_days(start: date, end: date) -> int:
+    # R7: Mon-Fri, no holiday calendar
+    return sum(1 for i in range((end - start).days + 1) if (start + timedelta(days=i)).weekday() < 5)
+
+
+def round_half_up(value, places: int) -> float:
+    # $round in MongoDB rounds half to even, so R8 is applied here; str() keeps floats like 0.5 exact
+    return float(Decimal(str(value)).quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP))
+
+
+def employee_monthly_pipeline(emp_code: str, month: str) -> list[dict]:
+    first, last = month_bounds(month)
+    return [
+        {"$match": {"emp_code": emp_code, "date": {"$gte": first.isoformat(), "$lte": last.isoformat()}}},
+        {
+            "$group": {
+                "_id": None,
+                # R7: present days only count Mon-Fri; late and overtime include weekends
+                "present_days": {"$sum": {"$cond": [IS_WEEKDAY, PRESENT_VALUE, 0]}},
+                "leave_days": {"$sum": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]}},
+                "late_count": {"$sum": {"$cond": [{"$gt": [LATE_MINUTES, 0]}, 1, 0]}},
+                "total_late_minutes": {"$sum": LATE_MINUTES},
+                "total_overtime_minutes": {"$sum": {"$ifNull": ["$overtime_minutes", 0]}},
+            }
+        },
+    ]
+
+
+@app.get("/analytics/employees/{emp_code}/monthly")
+def employee_monthly(emp_code: str, month: str = Query(pattern=MONTH_PATTERN)):
+    emp = db.employees.find_one({"emp_code": emp_code}, {"joined_on": 1})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+
+    first, last = month_bounds(month)
+    start = max(first, date.fromisoformat(emp["joined_on"]))
+    working_days = count_working_days(start, last) if start <= last else 0
+
+    totals = next(db.attendance_logs.aggregate(employee_monthly_pipeline(emp_code, month)), {})
+    present_days = totals.get("present_days", 0)
+    return {
+        "emp_code": emp_code,
+        "month": month,
+        "working_days": working_days,
+        "present_days": round_half_up(present_days, 2),
+        "leave_days": totals.get("leave_days", 0),
+        "late_count": totals.get("late_count", 0),
+        "total_late_minutes": totals.get("total_late_minutes", 0),
+        "total_overtime_minutes": totals.get("total_overtime_minutes", 0),
+        "attendance_pct": round_half_up(Decimal(str(present_days)) * 100 / working_days, 2) if working_days else None,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   GET   /analytics/employees/{emp_code}/monthly
 #   GET   /analytics/departments/summary
 #   GET   /analytics/leaderboard/late
 #   GET   /analytics/departments/{department}/trend
