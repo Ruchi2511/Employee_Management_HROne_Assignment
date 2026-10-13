@@ -14,6 +14,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Annotated, Literal, Optional
 
+from bson.decimal128 import Decimal128
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Path, Query
 from fastapi.exceptions import RequestValidationError
@@ -565,9 +566,80 @@ def employee_monthly(emp_code: str, month: str = Query(pattern=MONTH_PATTERN)):
     }
 
 
+DEPARTMENT_TOTALS = ["present_days", "late_count", "total_late_minutes", "leave_count", "on_duty_count",
+                     "work_hours_sum", "work_hours_count"]
+
+
+def department_summary_pipeline(month: str, department: Optional[str] = None) -> list[dict]:
+    first, last = month_bounds(month)
+    # R9: start from employees so people with no logs still count; later joiners are left out
+    match = {"joined_on": {"$lte": last.isoformat()}}
+    if department is not None:
+        match["department"] = department
+    # R4 average is over present records that have work_hours; summed as decimals so float drift can't move R8 rounding
+    has_hours = {"$and": [{"$in": ["$status", PRESENCE_STATUSES]}, {"$ne": [{"$ifNull": ["$work_hours", None]}, None]}]}
+    return [
+        {"$match": match},
+        {
+            "$lookup": {
+                "from": "attendance_logs",
+                "localField": "emp_code",
+                "foreignField": "emp_code",
+                # emp_code plus a date range, so each lookup reads the unique {emp_code, date} index
+                "pipeline": [
+                    {"$match": {"date": {"$gte": first.isoformat(), "$lte": last.isoformat()}}},
+                    {
+                        "$group": {
+                            "_id": None,
+                            "present_days": {"$sum": {"$cond": [IS_WEEKDAY, PRESENT_VALUE, 0]}},
+                            "late_count": {"$sum": {"$cond": [{"$gt": [LATE_MINUTES, 0]}, 1, 0]}},
+                            "total_late_minutes": {"$sum": LATE_MINUTES},
+                            "leave_count": {"$sum": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]}},
+                            "on_duty_count": {"$sum": {"$cond": [{"$eq": ["$status", "ON_DUTY"]}, 1, 0]}},
+                            "work_hours_sum": {"$sum": {"$cond": [has_hours, {"$toDecimal": "$work_hours"}, 0]}},
+                            "work_hours_count": {"$sum": {"$cond": [has_hours, 1, 0]}},
+                        }
+                    },
+                ],
+                "as": "month",
+            }
+        },
+        # "month" holds one row, or none for an employee with no logs, so the inner $sum gives 0 then
+        {
+            "$group": {
+                "_id": "$department",
+                "headcount": {"$sum": 1},
+                **{field: {"$sum": {"$sum": f"$month.{field}"}} for field in DEPARTMENT_TOTALS},
+            }
+        },
+        {"$sort": {"_id": 1}},
+    ]
+
+
+def to_decimal(value) -> Decimal:
+    return value.to_decimal() if isinstance(value, Decimal128) else Decimal(str(value))
+
+
+@app.get("/analytics/departments/summary")
+def department_summary(month: str = Query(pattern=MONTH_PATTERN), department: Optional[str] = None):
+    items = []
+    for row in db.employees.aggregate(department_summary_pipeline(month, department)):
+        count = row["work_hours_count"]
+        items.append({
+            "department": row["_id"],
+            "headcount": row["headcount"],
+            "present_days": round_half_up(row["present_days"], 2),
+            "avg_work_hours": round_half_up(to_decimal(row["work_hours_sum"]) / count, 2) if count else None,
+            "late_count": row["late_count"],
+            "total_late_minutes": row["total_late_minutes"],
+            "leave_count": row["leave_count"],
+            "on_duty_count": row["on_duty_count"],
+        })
+    return {"month": month, "items": items}
+
+
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   GET   /analytics/departments/summary
 #   GET   /analytics/leaderboard/late
 #   GET   /analytics/departments/{department}/trend
 #   GET   /admin/explain/{endpoint}
