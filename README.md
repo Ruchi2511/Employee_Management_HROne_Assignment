@@ -1,74 +1,44 @@
 # Employee Attendance & Analytics API
 
-A FastAPI + MongoDB backend for the HROne attendance assignment. Employees punch in and out, HR corrects records,
-and analytics endpoints answer questions about lateness, departments and trends. All application code is in
-`app/main.py` and follows `openapi.yaml` (business rules R1-R10) and `DATA_MODEL.md`.
+My submission for the HROne assignment: a FastAPI + MongoDB service for attendance, corrections and analytics.
+All the code is in `app/main.py`, and it follows `openapi.yaml` and `DATA_MODEL.md`.
 
-| Method | Path | What it does |
-|---|---|---|
-| GET | `/health` | 200 when MongoDB answers a ping, otherwise 503 |
-| POST, GET | `/employees` | Create an employee; list by department with pagination |
-| POST | `/attendance/punch-in`, `/attendance/punch-out` | Record the day's punches (race-safe) |
-| GET | `/attendance` | List records with filters, sorting and pagination |
-| PATCH | `/attendance/{emp_code}/{date}` | Correct a record and append to its history |
-| GET | `/analytics/employees/{emp_code}/monthly` | Monthly summary for one employee |
-| GET | `/analytics/departments/summary` | Monthly summary per department |
-| GET | `/analytics/leaderboard/late` | Late-comers ranking with ties |
-| GET | `/analytics/departments/{department}/trend` | Daily series with a 7-day moving average |
-| GET | `/admin/explain/{endpoint}` | MongoDB `executionStats` explain for an endpoint's main query |
+## How to run
 
-## Prerequisites
-
-- Python 3.11 or newer
-- MongoDB 6.0 or newer (the target environment is MongoDB 7.0)
-
-## Setup
+You need Python 3.11+ and MongoDB 6.0+ (I tested on MongoDB 7.0).
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 python -m pip install -r requirements.txt
 cp .env.example .env               # Windows: copy .env.example .env
-```
-
-Set `MONGO_URI` and `MONGO_DB` in `.env` or as environment variables. Real environment variables take priority over
-`.env`.
-
-## Run
-
-```bash
 uvicorn app.main:app --port 8000
 ```
 
-- Health check: `curl http://localhost:8000/health` returns `{"status": "ok"}`
-- Swagger UI: http://localhost:8000/docs (OpenAPI JSON at `/openapi.json`)
+The app reads `MONGO_URI` and `MONGO_DB` from the environment. A `.env` file also works, but real environment
+variables win. `GET /health` returns 200 once MongoDB answers, and Swagger is at `http://localhost:8000/docs`.
 
-Indexes are created at startup and the step is safe to repeat, so the app can start against a database that
-already holds data.
+All indexes are created at startup, so there are no manual steps. It is safe to start the app on a database that
+already has data and indexes.
 
-### Sample data (optional)
+`python sample_seed.py` loads the nine sample documents, but **it deletes everything in `employees` and
+`attendance_logs` first**. Only run it on a scratch database.
 
-> **Warning:** `python sample_seed.py` **deletes every document in `employees` and `attendance_logs`** of the
-> database named by `MONGO_DB` before loading the nine sample documents. Only run it against a scratch database,
-> never against real data.
+## What is done
 
-## Things to know
+Every endpoint in `openapi.yaml` is implemented, including the four analytics endpoints and
+`/admin/explain/{endpoint}`. Nothing is missing. The starter's defects and my fixes are in `REVIEW.md`, and my
+answers to the five questions are in `DECISIONS.md`.
 
-- **Indexes.** `employees`: unique `emp_code`, `{department, emp_code}`, `joined_on`. `attendance_logs`: unique
-  `{emp_code, date}` (one record per person per day; it also settles concurrent punch-ins), `{date: -1, emp_code}`,
-  `{emp_code, punch_in: -1}`.
-- **Concurrency.** Duplicate creates and punch-ins are rejected by the unique indexes (409). Punch-out and PATCH only
-  save if the record has not changed since it was read; the loser gets 409, so no history entry is lost.
-- **Time.** The API uses epoch milliseconds; MongoDB stores UTC datetimes. Attendance dates and shift times are IST,
-  instants are truncated to whole seconds, and overnight shifts belong to the day they started.
-- **Rounding.** Work hours, `present_days`, `avg_work_hours` and `attendance_pct` use 2 decimals half-up; the trend's
-  `attendance_rate` and `moving_avg_7d` use 4 decimals half-up. MongoDB's `$round` rounds half to even, so half-up is
-  done with decimals instead.
-- **`joined_on`.** Working days and headcount start from `joined_on`. Attendance logs dated before `joined_on` still
-  count toward the totals. The department summary and trend leave out employees who join after the period,
-  together with their logs; the leaderboard ranks by logs alone.
-- **Trend range.** `from` and `to` are inclusive and may cover at most 92 days; 93 or more is a 422.
-- **Explain.** `/admin/explain/attendance_list` explains the paged `find` (not the `count_documents` used for `total`).
-  The analytics targets reuse the same pipeline functions as their endpoints.
-- **Empty filters.** A query parameter sent with an empty value (for example `department=`) filters for an empty
-  string rather than being ignored.
+## Things you should know
+
+- Two identical punch-ins, two creates with the same `emp_code`, or two punch-outs: one wins and the rest get 409,
+  because of the unique indexes. A PATCH only saves if the record hasn't changed since it was read, so no history
+  entry is lost.
+- All rounding is half-up. MongoDB's `$round` rounds half to even, so I round with decimals instead. Reported
+  numbers use 2 decimals, including `attendance_pct`. The trend's `attendance_rate` and `moving_avg_7d` use 4.
+- Working days and headcount start from `joined_on`, but logs dated before `joined_on` still count. The department
+  summary and trend leave out people who join after the period.
+- The trend accepts up to 92 days, counting both `from` and `to`. 93 days or more is a 422.
+- `/admin/explain/attendance_list` explains the paged `find`, not the count used for `total`.
+- A filter sent empty, like `department=`, looks for an empty value instead of being ignored.
