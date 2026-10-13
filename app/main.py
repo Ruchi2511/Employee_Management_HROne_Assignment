@@ -18,9 +18,10 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.exceptions import RequestValidationError
 from pydantic import AfterValidator, BaseModel, Field, StrictInt, model_validator
+import pymongo
 from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
 from pymongo.database import Database
-from pymongo.errors import DuplicateKeyError
+from pymongo.errors import DuplicateKeyError, PyMongoError
 
 load_dotenv()
 
@@ -85,10 +86,8 @@ app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0", life
 def truncate_to_second(dt: datetime) -> datetime:
     return dt.replace(microsecond=0)
 
-
 def utc_now() -> datetime:
     return truncate_to_second(datetime.now(UTC))
-
 
 def ms_to_datetime(ms: int) -> datetime:
     # integer division keeps it exact and drops the sub-second part (R1)
@@ -100,15 +99,11 @@ def datetime_to_ms(dt: datetime) -> int:
         dt = dt.replace(tzinfo=UTC)  # PyMongo treats naive datetimes as UTC
     return (dt - EPOCH) // timedelta(seconds=1) * 1000
 
-
-def validation_error(field: str, msg: str) -> RequestValidationError:
-    # same 422 body shape FastAPI uses for schema errors, as the contract expects
-    return RequestValidationError([{"type": "value_error", "loc": ("body", field), "msg": msg, "input": None}])
-
+def validation_error(field: str, msg: str, where: str = "body") -> RequestValidationError:
+    return RequestValidationError([{"type": "value_error", "loc": (where, field), "msg": msg, "input": None}])
 
 def _ms_or_none(value):
     return datetime_to_ms(value) if isinstance(value, datetime) else value
-
 
 # --------------------------------------------------------------------------- #
 # Serializers
@@ -126,7 +121,6 @@ def serialize_history_entry(entry: dict) -> dict:
         "changes": changes,
     }
 
-
 def serialize_employee(doc: dict) -> dict:
     return {
         "emp_code": doc["emp_code"],
@@ -138,7 +132,6 @@ def serialize_employee(doc: dict) -> dict:
         "joined_on": doc["joined_on"],
         "created_at": _ms_or_none(doc.get("created_at")),
     }
-
 
 def serialize_attendance(doc: dict) -> dict:
     # explicit field list so _id never leaks; legacy records may lack the last few fields
@@ -154,7 +147,6 @@ def serialize_attendance(doc: dict) -> dict:
         "half_day": bool(doc.get("half_day", False)),
         "history": [serialize_history_entry(e) for e in doc.get("history") or []],
     }
-
 
 # --------------------------------------------------------------------------- #
 # Helpers
@@ -205,7 +197,8 @@ def _check_calendar_date(value: str) -> str:
 
 
 # [0-9] rather than \d so non-ASCII digits are rejected
-IsoDate = Annotated[str, Field(pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$"), AfterValidator(_check_calendar_date)]
+DATE_PATTERN = r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+IsoDate = Annotated[str, Field(pattern=DATE_PATTERN), AfterValidator(_check_calendar_date)]
 ShiftTime = Annotated[str, Field(pattern=r"^([01][0-9]|2[0-3]):[0-5][0-9]$")]
 
 
@@ -226,6 +219,7 @@ class EmployeeIn(BaseModel):
 
 
 PresenceStatus = Literal["PRESENT", "WFH", "ON_DUTY"]
+Status = Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]
 
 
 class PunchInIn(BaseModel):
@@ -245,6 +239,12 @@ class PunchOutIn(BaseModel):
 # --------------------------------------------------------------------------- #
 @app.get("/health")
 def health():
+    # short timeout so a dead database answers 503 quickly instead of after server selection
+    try:
+        with pymongo.timeout(2):
+            client.admin.command("ping")
+    except PyMongoError:
+        raise HTTPException(503, "database unavailable")
     return {"status": "ok"}
 
 
@@ -342,30 +342,43 @@ def punch_out(body: PunchOutIn):
 @app.get("/attendance")
 def list_attendance(
     emp_code: Optional[str] = None,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    status: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 20,
+    date_from: Optional[str] = Query(None, pattern=DATE_PATTERN),
+    date_to: Optional[str] = Query(None, pattern=DATE_PATTERN),
+    status: Optional[Status] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
 ):
+    for name, value in (("date_from", date_from), ("date_to", date_to)):
+        if value is not None:
+            try:
+                date.fromisoformat(value)
+            except ValueError:
+                raise validation_error(name, "not a valid calendar date", "query")
+    if date_from is not None and date_to is not None and date_from > date_to:
+        raise validation_error("date_from", "must be on or before date_to", "query")
+
     q = {}
-    if emp_code:
+    if emp_code is not None:
         q["emp_code"] = emp_code
-    if date_from or date_to:
+    if date_from is not None or date_to is not None:
         q["date"] = {}
-        if date_from:
+        if date_from is not None:
             q["date"]["$gte"] = date_from
-        if date_to:
+        if date_to is not None:
             q["date"]["$lte"] = date_to
-    if status:
+    if status is not None:
         q["status"] = status
-    docs = list(db.attendance_logs.find(q))
-    docs.sort(key=lambda d: d["date"], reverse=True)
-    total = len(docs)
-    page_docs = docs[(page - 1) * page_size : page * page_size]
-    for d in page_docs:
-        d["id"] = str(d.pop("_id"))
-    return {"items": page_docs, "total": total, "page": page, "page_size": page_size}
+
+    total = db.attendance_logs.count_documents(q)
+    docs = db.attendance_logs.find(
+        q,
+        {"_id": 0},
+        sort=[("date", DESCENDING), ("emp_code", ASCENDING)],
+        skip=(page - 1) * page_size,
+        limit=page_size,
+    )
+    items = [serialize_attendance(d) for d in docs]
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
 # --------------------------------------------------------------------------- #
