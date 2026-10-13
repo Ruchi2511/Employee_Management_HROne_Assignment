@@ -11,3 +11,6 @@ __pycache__/
 htmlcov/
 .idea/
 .vscode/
+
+# test suite is kept local and is not part of the submission
+tests/
