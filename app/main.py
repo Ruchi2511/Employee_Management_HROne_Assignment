@@ -8,12 +8,14 @@ This file was written quickly by a colleague who has left the company. The happy
 works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expected of you,
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
+import json
 import os
 from contextlib import asynccontextmanager
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Annotated, Literal, Optional
 
+from bson import json_util
 from bson.decimal128 import Decimal128
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Path, Query
@@ -362,6 +364,21 @@ def list_attendance(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
 ):
+    query = attendance_list_query(emp_code, date_from, date_to, status, page, page_size)
+    total = db.attendance_logs.count_documents(query["filter"])
+    docs = db.attendance_logs.find(
+        query["filter"],
+        query["projection"],
+        sort=list(query["sort"].items()),
+        skip=query["skip"],
+        limit=query["limit"],
+    )
+    items = [serialize_attendance(d) for d in docs]
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
+
+
+def attendance_list_query(emp_code, date_from, date_to, status, page, page_size) -> dict:
+    # shared with the explain endpoint so both run the same find
     for name, value in (("date_from", date_from), ("date_to", date_to)):
         if value is not None:
             try:
@@ -382,17 +399,13 @@ def list_attendance(
             q["date"]["$lte"] = date_to
     if status is not None:
         q["status"] = status
-
-    total = db.attendance_logs.count_documents(q)
-    docs = db.attendance_logs.find(
-        q,
-        {"_id": 0},
-        sort=[("date", DESCENDING), ("emp_code", ASCENDING)],
-        skip=(page - 1) * page_size,
-        limit=page_size,
-    )
-    items = [serialize_attendance(d) for d in docs]
-    return {"items": items, "total": total, "page": page, "page_size": page_size}
+    return {
+        "filter": q,
+        "projection": {"_id": 0},
+        "sort": {"date": DESCENDING, "emp_code": ASCENDING},
+        "skip": (page - 1) * page_size,
+        "limit": page_size,
+    }
 
 NON_PRESENCE = ("ABSENT", "LEAVE")
 EDITABLE_FIELDS = ("status", "punch_in", "punch_out")
@@ -749,6 +762,14 @@ def department_trend(
     start: str = Query(alias="from", pattern=DATE_PATTERN),
     end: str = Query(alias="to", pattern=DATE_PATTERN),
 ):
+    check_trend_range(start, end)
+    if db.employees.find_one({"department": department}, {"_id": 1}) is None:
+        raise HTTPException(404, "department not found")
+    items = list(db.employees.aggregate(department_trend_pipeline(department, start, end)))
+    return {"department": department, "items": items}
+
+
+def check_trend_range(start: str, end: str) -> None:
     days = {}
     for name, value in (("from", start), ("to", end)):
         try:
@@ -760,13 +781,63 @@ def department_trend(
     if (days["to"] - days["from"]).days + 1 > MAX_TREND_DAYS:
         raise validation_error("to", f"range is longer than {MAX_TREND_DAYS} days", "query")
 
-    if db.employees.find_one({"department": department}, {"_id": 1}) is None:
-        raise HTTPException(404, "department not found")
-    items = list(db.employees.aggregate(department_trend_pipeline(department, start, end)))
-    return {"department": department, "items": items}
-
 
 # --------------------------------------------------------------------------- #
-# TODO - the rest of the contract (see openapi.yaml):
-#   GET   /admin/explain/{endpoint}
+# Admin
 # --------------------------------------------------------------------------- #
+ExplainTarget = Literal["attendance_list", "employee_monthly", "department_summary", "late_leaderboard",
+                        "department_trend"]
+
+
+def require(**params) -> None:
+    for name, value in params.items():
+        if value is None:
+            raise validation_error(name, "field required", "query")
+
+
+def run_explain(command: dict) -> dict:
+    plan = db.command("explain", command, verbosity="executionStats")
+    # explain output holds BSON types (Timestamp, Int64, ...) that FastAPI can't encode
+    return json.loads(json_util.dumps(plan, json_options=json_util.RELAXED_JSON_OPTIONS))
+
+
+@app.get("/admin/explain/{endpoint}")
+def explain_endpoint(
+    endpoint: ExplainTarget,
+    emp_code: Optional[str] = None,
+    month: Optional[str] = Query(None, pattern=MONTH_PATTERN),
+    department: Optional[str] = None,
+    limit: int = Query(10, ge=1, le=50),
+    date_from: Optional[str] = Query(None, pattern=DATE_PATTERN),
+    date_to: Optional[str] = Query(None, pattern=DATE_PATTERN),
+    status: Optional[Status] = None,
+    start: Optional[str] = Query(None, alias="from", pattern=DATE_PATTERN),
+    end: Optional[str] = Query(None, alias="to", pattern=DATE_PATTERN),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    # each target is built by the same function its endpoint uses
+    if endpoint == "attendance_list":
+        collection = "attendance_logs"
+        query = attendance_list_query(emp_code, date_from, date_to, status, page, page_size)
+        command = {"find": collection, **query}
+    elif endpoint == "employee_monthly":
+        require(emp_code=emp_code, month=month)
+        collection = "attendance_logs"
+        command = {"aggregate": collection, "pipeline": employee_monthly_pipeline(emp_code, month), "cursor": {}}
+    elif endpoint == "department_summary":
+        require(month=month)
+        collection = "employees"
+        command = {"aggregate": collection, "pipeline": department_summary_pipeline(month, department), "cursor": {}}
+    elif endpoint == "late_leaderboard":
+        require(month=month)
+        collection = "attendance_logs"
+        command = {"aggregate": collection, "pipeline": late_leaderboard_pipeline(month, limit, department),
+                   "cursor": {}}
+    else:
+        require(department=department, **{"from": start, "to": end})
+        check_trend_range(start, end)
+        collection = "employees"
+        command = {"aggregate": collection, "pipeline": department_trend_pipeline(department, start, end),
+                   "cursor": {}}
+    return {"endpoint": endpoint, "collection": collection, "explain": run_explain(command)}
